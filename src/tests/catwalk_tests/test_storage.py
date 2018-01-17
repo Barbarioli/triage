@@ -64,49 +64,50 @@ def test_MemoryStore():
 
 class MatrixStoreTest(unittest.TestCase):
 
-    def matrix_store(self):
+    def matrix_store(self, project_path=None):
         data_dict = OrderedDict([
             ('entity_id', [1, 2]),
             ('k_feature', [0.5, 0.4]),
             ('m_feature', [0.4, 0.5]),
             ('label', [0, 1])
         ])
-        df = pandas.DataFrame.from_dict(data_dict)
+        df = pandas.DataFrame.from_dict(data_dict).set_index(['entity_id'])
         metadata = {
             'label_name': 'label',
             'indices': ['entity_id'],
+            'end_time': '2016-01-01',
         }
 
         inmemory = InMemoryMatrixStore(matrix=df, metadata=metadata)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpcsv = os.path.join(tmpdir, 'df.csv')
-            tmpyaml = os.path.join(tmpdir, 'metadata.yaml')
-            tmphdf = os.path.join(tmpdir, 'df.h5')
-            with open(tmpyaml, 'w') as outfile:
-                yaml.dump(metadata, outfile, default_flow_style=False)
-                df.to_csv(tmpcsv, index=False)
-                df.to_hdf(tmphdf, 'matrix')
-                csv = CSVMatrixStore(matrix_path=tmpcsv, metadata_path=tmpyaml)
-                hdf = HDFMatrixStore(matrix_path=tmphdf, metadata_path=tmpyaml)
+        def build_and_assert(path):
+            CSVMatrixStore(project_path=path, matrix=df, metadata=metadata).save()
+            HDFMatrixStore(project_path=path, matrix=df, metadata=metadata).save()
+            csv = CSVMatrixStore(project_path=path, metadata=metadata)
+            hdf = HDFMatrixStore(project_path=path, metadata=metadata)
 
-                assert csv.matrix.to_dict() == inmemory.matrix.to_dict()
-                assert hdf.matrix.to_dict() == inmemory.matrix.to_dict()
+            assert csv.matrix.to_dict() == inmemory.matrix.to_dict()
+            assert hdf.matrix.to_dict() == inmemory.matrix.to_dict()
 
-                assert csv.metadata == inmemory.metadata
-                assert hdf.metadata == inmemory.metadata
+            assert csv.metadata == inmemory.metadata
+            assert hdf.metadata == inmemory.metadata
 
-                assert csv.head_of_matrix.to_dict() == inmemory.head_of_matrix.to_dict()
-                assert hdf.head_of_matrix.to_dict() == inmemory.head_of_matrix.to_dict()
+            assert csv.head_of_matrix.to_dict() == inmemory.head_of_matrix.to_dict()
+            assert hdf.head_of_matrix.to_dict() == inmemory.head_of_matrix.to_dict()
 
-                assert csv.empty == inmemory.empty
-                assert hdf.empty == inmemory.empty
+            assert csv.empty == inmemory.empty
+            assert hdf.empty == inmemory.empty
 
-                assert csv.labels().to_dict() == inmemory.labels().to_dict()
-                assert hdf.labels().to_dict() == inmemory.labels().to_dict()
+            assert csv.labels().to_dict() == inmemory.labels().to_dict()
+            assert hdf.labels().to_dict() == inmemory.labels().to_dict()
+            return [inmemory, hdf, csv]
 
-        matrix_store = [inmemory, hdf, csv]
-        return matrix_store
+        if project_path:
+            matrix_stores = build_and_assert(project_path)
+        else:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                matrix_stores = build_and_assert(tmpdir)
+        return matrix_stores
 
     def test_MatrixStore_resort_columns(self):
         matrix_store_list = self.matrix_store()
@@ -201,18 +202,6 @@ class MatrixStoreTest(unittest.TestCase):
             s3_conn = boto.connect_s3()
             bucket_name = 'fake-matrix-bucket'
             s3_conn.create_bucket(bucket_name)
-
-            matrix_store_list = self.matrix_store()
-
-            for matrix_store in matrix_store_list:
-                matrix_store.save(project_path='s3://fake-matrix-bucket', name='test')
-
-            # HDF
-            hdf = HDFMatrixStore(matrix_path='s3://fake-matrix-bucket/test.h5', metadata_path='s3://fake-matrix-bucket/test.yaml')
-            # CSV
-            csv = CSVMatrixStore(matrix_path='s3://fake-matrix-bucket/test.csv', metadata_path='s3://fake-matrix-bucket/test.yaml')
-
-            assert csv.metadata == matrix_store_list[0].metadata
-            assert csv.matrix.to_dict() == matrix_store_list[0].matrix.to_dict()
-            assert hdf.metadata == matrix_store_list[0].metadata
-            assert hdf.matrix.to_dict() == matrix_store_list[0].matrix.to_dict()
+            project_path = 's3://fake-matrix-bucket'
+            # the matrix_store() method will take care of all the assertions we want
+            matrix_store_list = self.matrix_store(project_path)

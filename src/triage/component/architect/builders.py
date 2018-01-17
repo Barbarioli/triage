@@ -1,17 +1,19 @@
-import io
 import logging
-import pandas
 import os
+
+from .utils import df_from_query, verify_dataframe_no_nulls
 
 from triage.component import metta
 
 
-class BuilderBase(object):
-    def __init__(self, db_config, matrix_directory, engine, replace=True):
+class MatrixBuilder(object):
+    def __init__(self, db_config, matrix_directory, matrix_store_constructor, engine, replace=True):
         self.db_config = db_config
         self.matrix_directory = matrix_directory
+        self.matrix_store_constructor = matrix_store_constructor
         self.engine = engine
         self.replace = replace
+        self.index = ['entity_id', 'as_of_date']
 
     def validate(self):
         for expected_db_config_val in [
@@ -184,8 +186,6 @@ class BuilderBase(object):
         )
         return query
 
-
-class CSVBuilder(BuilderBase):
     def build_matrix(
         self,
         as_of_times,
@@ -242,50 +242,39 @@ class CSVBuilder(BuilderBase):
         )
         logging.info('Extracting feature group data from database into file '
                      'for matrix %s', matrix_uuid)
-        features_csv_names = self.write_features_data(
+        features_dataframes = self.retrieve_features_data(
             as_of_times,
             feature_dictionary,
             entity_date_table_name,
             matrix_uuid
         )
-        try:
-            logging.info('Extracting label data frmo database into file for '
-                         'matrix %s', matrix_uuid)
-            labels_csv_name = self.write_labels_data(
-                label_name,
-                label_type,
-                entity_date_table_name,
-                matrix_uuid,
-                matrix_metadata['label_timespan']
-            )
-            features_csv_names.insert(0, labels_csv_name)
+        logging.info('Extracting label data from database into file for '
+                     'matrix %s', matrix_uuid)
+        labels_dataframe = self.retrieve_labels_data(
+            label_name,
+            label_type,
+            entity_date_table_name,
+            matrix_uuid,
+            matrix_metadata['label_timespan']
+        )
 
-            # stitch together the csvs
-            logging.info('Merging feature files for matrix %s', matrix_uuid)
-            output = self.merge_feature_csvs(
-                features_csv_names,
-                matrix_directory,
-                matrix_uuid
-            )
-        finally:
-            # clean up files and database before finishing
-            for csv_name in features_csv_names:
-                self.remove_file(csv_name)
+        # stitch together the csvs
+        logging.info('Merging feature files for matrix %s', matrix_uuid)
+        output = self.merge_dataframes([labels_dataframe] + features_dataframes)
         try:
             # store the matrix
             logging.info('Archiving matrix %s with metta', matrix_uuid)
-            metta.archive_matrix(
-                matrix_config=matrix_metadata,
-                df_matrix=output,
-                overwrite=True,
-                directory=self.matrix_directory,
-                format='csv'
+            matrix_store = self.matrix_store_constructor(
+                project_path=self.matrix_directory,
+                metadata=matrix_metadata,
+                matrix=output
             )
+            matrix_store.save()
         finally:
             if isinstance(output, str):
                 os.remove(output)
 
-    def write_labels_data(
+    def retrieve_labels_data(
         self,
         label_name,
         label_type,
@@ -310,10 +299,6 @@ class CSVBuilder(BuilderBase):
         :return: name of csv containing labels
         :rtype: str
         """
-        csv_name = os.path.join(
-            self.matrix_directory,
-            '{}-{}.csv'.format(matrix_uuid, self.db_config['labels_table_name'])
-        )
         labels_query = self._outer_join_query(
             right_table_name='{schema}.{table}'.format(
                 schema=self.db_config['labels_schema_name'],
@@ -335,10 +320,14 @@ class CSVBuilder(BuilderBase):
             )
         )
 
-        self.write_to_csv(labels_query, csv_name)
-        return(csv_name)
+        return df_from_query(
+            self.engine,
+            labels_query,
+            self.index,
+            read_csv_args={'parse_dates': ['as_of_date']}
+        )
 
-    def write_features_data(
+    def retrieve_features_data(
         self,
         as_of_times,
         feature_dictionary,
@@ -364,13 +353,9 @@ class CSVBuilder(BuilderBase):
         :rtype: tuple
         """
         # iterate! for each table, make query, write csv, save feature & file names
-        features_csv_names = []
+        features_dataframes = []
         for feature_table_name, feature_names in feature_dictionary.items():
             logging.info('Retrieving feature data from %s', feature_table_name)
-            csv_name = os.path.join(
-                self.matrix_directory,
-                '{}-{}.csv'.format(matrix_uuid, feature_table_name)
-            )
             features_query = self._outer_join_query(
                 right_table_name='{schema}.{table}'.format(
                     schema=self.db_config['features_schema_name'],
@@ -386,62 +371,18 @@ class CSVBuilder(BuilderBase):
                 # database encounters any during the outer join
                 right_column_selections=[', "{0}"'.format(fn) for fn in feature_names]
             )
-            self.write_to_csv(features_query, csv_name)
-            features_csv_names.append(csv_name)
-
-        return(features_csv_names)
-
-    def write_to_csv(self, query_string, file_name, header='HEADER'):
-        """ Given a query, write the requested data to csv.
-
-        :param query_string: query to send
-        :param file_name: name to save the file as
-        :header: text to include in query indicating if a header should be saved
-                 in output
-        :type query_string: str
-        :type file_name: str
-        :type header: str
-
-        :return: none
-        :rtype: none
-        """
-        matrix_csv = self.open_fh_for_writing(file_name)
-        logging.debug('Copying to CSV query %s', query_string)
-        try:
-            copy_sql = 'COPY ({query}) TO STDOUT WITH CSV {head}'.format(
-                query=query_string,
-                head=header
+            features_dataframes.append(
+                df_from_query(
+                    self.engine,
+                    features_query,
+                    self.index,
+                    read_csv_args={'parse_dates': ['as_of_date']}
+                )
             )
-            conn = self.engine.raw_connection()
-            cur = conn.cursor()
-            cur.copy_expert(copy_sql, matrix_csv)
-        finally:
-            self.close_filehandle(file_name)
 
+        return(features_dataframes)
 
-class HighMemoryCSVBuilder(CSVBuilder):
-    def __init__(self, *args, **kwargs):
-        super(HighMemoryCSVBuilder, self).__init__(*args, **kwargs)
-        self.filehandles = {}
-
-    def open_fh_for_writing(self, filename):
-        self.filehandles[filename] = io.StringIO()
-        return self.filehandles[filename]
-
-    def open_fh_for_reading(self, filename):
-        self.filehandles[filename].seek(0)
-        return self.filehandles[filename]
-
-    def close_filehandles(self):
-        pass
-
-    def close_filehandle(self, filename):
-        pass
-
-    def remove_file(self, filename):
-        del self.filehandles[filename]
-
-    def merge_feature_csvs(self, source_filenames, matrix_directory, matrix_uuid):
+    def merge_dataframes(self, dataframes):
         """Horizontally merge a list of feature CSVs
         Assumptions:
         - The first and second columns of each CSV are
@@ -465,27 +406,8 @@ class HighMemoryCSVBuilder(CSVBuilder):
         :raises: ValueError if the first two columns in every CSV don't match
         """
 
-        source_filehandles = [self.open_fh_for_reading(fname) for fname in source_filenames]
-        dataframes = []
-        for i, filehandle in enumerate(source_filehandles):
-            df = pandas.read_csv(filehandle)
-            df.set_index(['entity_id', 'as_of_date'], inplace=True)
-            dataframes.append(df)
+        for dataframe in dataframes[1:]:
+            verify_dataframe_no_nulls(dataframe)
 
-            # check for any nulls. the labels, understood to be the first file,
-            # can have nulls but no features should. therefore, skip the first dataframe
-            if i > 0:
-                columns_with_nulls = [
-                    column
-                    for column in df.columns
-                    if df[column].isnull().values.any()
-                ]
-                if len(columns_with_nulls) > 0:
-                    raise ValueError(
-                        "Imputation failed for the following features: %s" %
-                        columns_with_nulls
-                    )
-            i += 1
-
-        big_df = dataframes[1].join(dataframes[2:] + [dataframes[0]])
-        return big_df
+        big_dataframe = dataframes[1].join(dataframes[2:] + [dataframes[0]])
+        return big_dataframe

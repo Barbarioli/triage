@@ -16,6 +16,7 @@ from triage.component.architect.features import (
 )
 from triage.component.architect.planner import Planner
 from triage.component.architect.state_table_generators import StateTableGenerator
+from triage.component.architect.builders import MatrixBuilder
 from triage.component.timechop import Timechop
 from triage.component.catwalk.db import ensure_db
 from triage.component.catwalk.model_trainers import ModelTrainer
@@ -43,6 +44,7 @@ class ExperimentBase(object, metaclass=ABCMeta):
         config,
         db_engine,
         model_storage_class=None,
+        matrix_storage_class=CSVMatrixStore,
         project_path=None,
         replace=True,
         cleanup_timeout=None,
@@ -54,7 +56,7 @@ class ExperimentBase(object, metaclass=ABCMeta):
         if model_storage_class:
             self.model_storage_engine = model_storage_class(
                 project_path=project_path)
-        self.matrix_store_class = CSVMatrixStore  # can't be configurable until Architect obeys
+        self.matrix_store_class = matrix_storage_class
         self.project_path = project_path
         self.replace = replace
         ensure_db(self.db_engine)
@@ -147,19 +149,25 @@ class ExperimentBase(object, metaclass=ABCMeta):
             feature_start_time=dt_from_str(split_config['feature_start_time']),
             label_names=['outcome'],
             label_types=['binary'],
+            matrix_directory=self.matrices_directory,
+            states=self.config.get('state_config', {}).get('state_filters', []),
+            user_metadata=self.config.get('user_metadata', {}),
+        )
+
+        self.matrix_builder_factory = partial(
+            MatrixBuilder,
             db_config={
                 'features_schema_name': self.features_schema_name,
                 'labels_schema_name': 'public',
                 'labels_table_name': self.labels_table_name,
-                # TODO: have planner/builder take state table later on, so we
+                # TODO: have builder take state table later on, so we
                 # can grab it from the StateTableGenerator instead of
                 # duplicating it here
                 'sparse_state_table_name': 'tmp_sparse_states_{}'
                                            .format(self.experiment_hash),
             },
             matrix_directory=self.matrices_directory,
-            states=self.config.get('state_config', {}).get('state_filters', []),
-            user_metadata=self.config.get('user_metadata', {}),
+            matrix_store_constructor=self.matrix_store_class,
             replace=self.replace
         )
 
@@ -201,12 +209,13 @@ class ExperimentBase(object, metaclass=ABCMeta):
             db_engine=self.db_engine)
         self.feature_group_creator = self.feature_group_creator_factory()
         self.feature_group_mixer = self.feature_group_mixer_factory()
-        self.planner = self.planner_factory(engine=self.db_engine)
+        self.planner = self.planner_factory()
         self.trainer = self.trainer_factory(db_engine=self.db_engine)
         self.predictor = self.predictor_factory(db_engine=self.db_engine)
         self.individual_importance_calculator = self.indiv_importance_factory(
             db_engine=self.db_engine)
         self.evaluator = self.evaluator_factory(db_engine=self.db_engine)
+        self.matrix_builder = self.matrix_builder_factory(engine=self.db_engine)
 
     @cachedproperty
     def split_definitions(self):
@@ -451,6 +460,7 @@ class ExperimentBase(object, metaclass=ABCMeta):
             split['train_matrix']['matrix_info_end_time'],
         )
 
+    
     def matrix_store(self, matrix_uuid):
         """Construct a matrix store for a given matrix uuid, using the Experiment's #matrix_store_class
 
@@ -458,14 +468,8 @@ class ExperimentBase(object, metaclass=ABCMeta):
             matrix_uuid (string) A uuid for a matrix
         """
         matrix_store = self.matrix_store_class(
-            matrix_path=os.path.join(
-                self.matrices_directory,
-                '{}.csv'.format(matrix_uuid)
-            ),
-            metadata_path=os.path.join(
-                self.matrices_directory,
-                '{}.yaml'.format(matrix_uuid)
-            )
+            project_path=self.matrices_directory,
+            matrix_uuid=matrix_uuid
         )
         return matrix_store
 

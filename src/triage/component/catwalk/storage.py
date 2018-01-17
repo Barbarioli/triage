@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 import pickle
@@ -12,6 +13,8 @@ from .utils import (
     model_cache_key,
     download_object,
 )
+
+from triage.component import metta
 
 
 class Store(object):
@@ -121,12 +124,32 @@ class InMemoryModelStorageEngine(ModelStorageEngine):
 class MatrixStore(object):
     _labels = None
 
-    def __init__(self, matrix_path=None, metadata_path=None):
-        self.matrix_path = matrix_path
-        self.metadata_path = metadata_path
-        self._matrix = None
-        self._metadata = None
+    def __init__(self, project_path, matrix_uuid=None, metadata=None, matrix=None):
+        self.project_path = project_path
+
+        if matrix_uuid:
+            self._matrix_uuid = matrix_uuid
+
+        if metadata:
+            self._generate_and_set_uuid(metadata)
+        else:
+            self._metadata = None
+
+        self.matrix_path = '/'.join([self.project_path, '{}.{}'.format(self.uuid, self.extension)])
+        self.metadata_path = '/'.join([self.project_path, '{}.yaml'.format(self.uuid)])
+
+        if matrix is not None:
+            self._matrix = matrix
+        else:
+            self._matrix = None
+
         self._head_of_matrix = None
+
+    def _generate_and_set_uuid(self, metadata):
+        self._matrix_uuid = metta.generate_uuid(metadata)
+        metadata_with_uuid = copy.deepcopy(metadata)
+        metadata_with_uuid['metta-uuid'] = self._matrix_uuid
+        self._metadata = metadata_with_uuid
 
     @property
     def matrix(self):
@@ -148,11 +171,7 @@ class MatrixStore(object):
 
     @property
     def empty(self):
-        if not os.path.isfile(self.matrix_path):
-            return True
-        else:
-            head_of_matrix = self.head_of_matrix
-            return head_of_matrix.empty
+        return self.head_of_matrix is None or self.head_of_matrix.empty
 
     def columns(self, include_label=False):
         head_of_matrix = self.head_of_matrix
@@ -176,7 +195,7 @@ class MatrixStore(object):
 
     @property
     def uuid(self):
-        return self.metadata['metta-uuid']
+        return self._matrix_uuid
 
     @property
     def as_of_dates(self):
@@ -215,7 +234,7 @@ class MatrixStore(object):
 
     def save_yaml(self, df, project_path, name):
         with smart_open.smart_open(os.path.join(project_path, name + ".yaml"), "wb") as f:
-            yaml.dump(df, f, encoding='utf-8')
+            yaml.dump(self.metadata, f, encoding='utf-8')
 
     def load_yaml(self, metadata_path):
         with smart_open.smart_open(metadata_path, "rb") as f:
@@ -236,16 +255,36 @@ class MatrixStore(object):
 
 
 class HDFMatrixStore(MatrixStore):
+    """
+    To support smart_open (and thus s3 storage), this code makes heavy use of a workaround
+    for reading and writing to a buffer instead of a local file. An example of the workaround is below:
+
+    https://github.com/pandas-dev/pandas/issues/9246#issuecomment-74041497
+
+    If the HDFStore ever supports a more direct way of dealing with buffers, we can simplify this code
+    with the solution. 
+    """
+    extension = 'h5'
 
     def _get_head_of_matrix(self):
-        try:
-            hdf = pandas.HDFStore(self.matrix_path)
-            key = hdf.keys()[0]
-            head_of_matrix = hdf.select(key, start=0, stop=1)
+        with smart_open.smart_open(self.matrix_path, "rb") as buffer:
+            try:
+                self._head_of_matrix = self._retrieve_first_row_of_matrix(buffer)
+            except pandas.errors.EmptyDataError:
+                self._head_of_matrix = None
+
+    def _retrieve_first_row_of_matrix(self, buffer):
+        print('reading first row!')
+        with pandas.HDFStore(
+                'data.h5', # this is not a bug! the filename doesn't matter, just to fool pandas
+                mode="r",
+                driver="H5FD_CORE",
+                driver_core_backing_store=0,
+                driver_core_image=buffer.read()) as store:
+            key = store.keys()[0]
+            head_of_matrix = store.select(key, start=0, stop=1)
             head_of_matrix.set_index(self.metadata['indices'], inplace=True)
-            self._head_of_matrix = head_of_matrix
-        except pandas.error.EmptyDataError:
-            self._head_of_matrix = None
+            return head_of_matrix
 
     def _load(self):
         with smart_open.smart_open(self.matrix_path, "rb") as f:
@@ -257,9 +296,11 @@ class HDFMatrixStore(MatrixStore):
             pass
 
     def _read_hdf_from_buffer(self, buffer):
+        print('reading!')
         with pandas.HDFStore(
-                "data.h5",
+                'data.h5',# this is not a bug! the filename doesn't matter, just to fool pandas
                 mode="r",
+                key="matrix",
                 driver="H5FD_CORE",
                 driver_core_backing_store=0,
                 driver_core_image=buffer.read()) as store:
@@ -276,27 +317,35 @@ class HDFMatrixStore(MatrixStore):
 
     def _write_hdf_to_buffer(self, df):
         with pandas.HDFStore(
-                "data.h5",
+                'data.h5', # this is not a bug! the filename doesn't matter, just to fool pandas
                 mode="w",
                 driver="H5FD_CORE",
                 driver_core_backing_store=0) as out:
-            out["matrix"] = df
+            print(df)
+            out['matrix'] = df
             return out._handle.get_file_image()
 
-    def save(self, project_path, name):
-        with smart_open.smart_open(os.path.join(project_path, name + ".h5"), "wb") as f:
+    def save(self):
+        with smart_open.smart_open(self.matrix_path, "wb") as f:
             f.write(self._write_hdf_to_buffer(self.matrix))
-        self.save_yaml(self.metadata, project_path, name)
+        self.save_yaml(self.metadata, self.project_path, self.uuid)
 
 
 class CSVMatrixStore(MatrixStore):
+    extension = 'csv'
+
     def _get_head_of_matrix(self):
         try:
-            head_of_matrix = pandas.read_csv(self.matrix_path, nrows=1)
-            head_of_matrix.set_index(self.metadata['indices'], inplace=True)
-            self._head_of_matrix = head_of_matrix
-        except pandas.error.EmptyDataError:
+            with smart_open.smart_open(self.matrix_path) as matrix_filehandle:
+                head_of_matrix = pandas.read_csv(matrix_filehandle, nrows=1)
+                head_of_matrix.set_index(self.metadata['indices'], inplace=True)
+                self._head_of_matrix = head_of_matrix
+        except pandas.errors.EmptyDataError:
             self._head_of_matrix = None
+        except KeyError:
+            import pdb
+            pdb.set_trace()
+            print('stuff')
 
     def _load(self):
         with smart_open.smart_open(self.matrix_path, "r") as f:
@@ -304,16 +353,16 @@ class CSVMatrixStore(MatrixStore):
         self._metadata = self.load_yaml(self.metadata_path)
         self._matrix.set_index(self.metadata['indices'], inplace=True)
 
-    def save(self, project_path, name):
-        with smart_open.smart_open(os.path.join(project_path, name + ".csv"), "w") as f:
+    def save(self):
+        with smart_open.smart_open(self.matrix_path, "w") as f:
             self.matrix.to_csv(f)
-        self.save_yaml(self.metadata, project_path, name)
+        self.save_yaml(self.metadata, self.project_path, self.uuid)
 
 
 class InMemoryMatrixStore(MatrixStore):
     def __init__(self, matrix, metadata, labels=None):
         self._matrix = matrix
-        self._metadata = metadata
+        self._generate_and_set_uuid(metadata)
         self._labels = labels
         self._head_of_matrix = None
 
@@ -331,5 +380,5 @@ class InMemoryMatrixStore(MatrixStore):
             self._matrix.set_index(self._metadata['indices'], inplace=True)
         return self._matrix
 
-    def save(self, project_path, name):
+    def save(self):
         return None

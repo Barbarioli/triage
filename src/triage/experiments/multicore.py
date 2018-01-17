@@ -164,7 +164,7 @@ class MultiCoreExperiment(ExperimentBase):
 
         partial_build_matrix = partial(
             build_matrix,
-            planner_factory=self.planner_factory,
+            builder_factory=self.matrix_builder_factory,
             db_connection_string=self.db_engine.url
         )
         logging.info(
@@ -211,14 +211,14 @@ def insert_into_table(
 
 def build_matrix(
     build_tasks,
-    planner_factory,
+    builder_factory,
     db_connection_string,
 ):
     try:
         db_engine = create_engine(db_connection_string)
-        planner = planner_factory(engine=db_engine)
+        builder = builder_factory(engine=db_engine)
         for build_task in build_tasks:
-            planner.build_matrix(**build_task)
+            builder.build_matrix(**build_task)
         return True
     except Exception:
         logging.error('Child error: %s', traceback.format_exc())

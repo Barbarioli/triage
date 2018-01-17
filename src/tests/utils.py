@@ -120,12 +120,12 @@ def sample_metta_csv_diff_order(directory):
     )
 
     train_store = CSVMatrixStore(
-        matrix_path=os.path.join(directory, '{}.csv'.format(train_uuid)),
-        metadata_path=os.path.join(directory, '{}.yaml'.format(train_uuid))
+        project_path=directory,
+        matrix_uuid=train_uuid,
     )
     test_store = CSVMatrixStore(
-        matrix_path=os.path.join(directory, '{}.csv'.format(test_uuid)),
-        metadata_path=os.path.join(directory, '{}.yaml'.format(test_uuid))
+        project_path=directory,
+        matrix_uuid=test_uuid,
     )
     return train_store, test_store
 
